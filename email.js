@@ -786,27 +786,30 @@ window._normalizeEmailHtml = function(html) {
         const block = blocks[parseInt(blockMatch[1], 10)] || '';
         // Inject inline styles into the list items so Gmail keeps them tight
         const tightBlock = block
-          .replace(/<ul([^>]*)>/gi, '<ul$1 style="margin:0 0 0 24px;padding:0">')
-          .replace(/<ol([^>]*)>/gi, '<ol$1 style="margin:0 0 0 24px;padding:0">')
-          .replace(/<li([^>]*)>/gi, '<li$1 style="margin:0 0 4px 0;line-height:1.5">');
-        htmlParts.push(`<div style="margin:0">${tightBlock}</div>`);
+          .replace(/<ul([^>]*)>/gi, '<ul$1 style="margin:0 0 0 24px;padding:0;font-size:14px;line-height:1.5">')
+          .replace(/<ol([^>]*)>/gi, '<ol$1 style="margin:0 0 0 24px;padding:0;font-size:14px;line-height:1.5">')
+          .replace(/<li([^>]*)>/gi, '<li$1 style="margin:0 0 4px 0;line-height:1.5;font-size:14px">');
+        htmlParts.push(`<div style="margin:0;font-size:14px;line-height:1.5">${tightBlock}</div>`);
       } else {
-        htmlParts.push(`<p style="margin:0;padding:0;line-height:1.5">${g.content}</p>`);
+        htmlParts.push(`<p style="margin:0;padding:0;line-height:1.5;font-size:14px">${g.content}</p>`);
       }
     } else if (g.type === 'ul') {
       // Detected text bullets → real, tight <ul>
       const items = g.items.map(item =>
-        `<li style="margin:0 0 4px 0;line-height:1.5">${item}</li>`
+        `<li style="margin:0 0 4px 0;line-height:1.5;font-size:14px">${item}</li>`
       ).join('');
-      htmlParts.push(`<ul style="margin:0 0 0 24px;padding:0">${items}</ul>`);
+      htmlParts.push(`<ul style="margin:0 0 0 24px;padding:0;font-size:14px;line-height:1.5">${items}</ul>`);
     }
     // Insert a guaranteed blank-line spacer BETWEEN blocks (not after the last one)
     if (i < grouped.length - 1) {
-      htmlParts.push('<p style="margin:0;padding:0;line-height:1.5">&nbsp;</p>');
+      htmlParts.push('<p style="margin:0;padding:0;line-height:1.5;font-size:14px">&nbsp;</p>');
     }
   });
 
-  return htmlParts.join('');
+  // Wrap everything in a master container that locks down font-family and font-size.
+  // Without this, Gmail can inherit fonts from quoted content or the user's compose styles,
+  // producing inconsistent sizing between paragraphs (the "not proportional in size" bug).
+  return `<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.5;color:#222">${htmlParts.join('')}</div>`;
 };
 
 console.log('✅ Enhanced Email System Loaded');
