@@ -24,7 +24,12 @@ window.sendGmailDirect = async function(to, subject, body) {
                 const sigFingerprint = sigText.slice(0, 60);
                 
                 if (sigFingerprint && !bodyText.includes(sigFingerprint)) {
-                    // Single <br> before -- is enough; the last <p> already has margin-bottom:1em
+                    // The body's last <p> already carries margin-bottom:1em (added by
+                    // _normalizeEmailHtml). Stacking that margin with the <br>--<br>
+                    // divider produces a double gap. Strip the margin from the final
+                    // paragraph only, so the divider provides the single line gap.
+                    body = body.replace(/(<p\b[^>]*style="[^"]*?)margin:0 0 1em 0;([^"]*"[^>]*>(?:(?!<p\b).)*)$/is, '$1margin:0;$2');
+                    // Single <br> before -- is enough; the last <p> already had margin-bottom:1em
                     body = body + '<br>--<br>' + sig;
                 }
             }
