@@ -608,7 +608,6 @@ window._normalizeEmailHtml = function(html) {
     if (!html) return '';
     let s = String(html);
 
-    // 1. Strip paste artifacts, comments, and zero-width spaces
     s = s.replace(/<!--[\s\S]*?-->/g, '');
     s = s.replace(/<meta[^>]*>/gi, '');
     s = s.replace(/<style[\s\S]*?<\/style>/gi, '');
@@ -616,28 +615,279 @@ window._normalizeEmailHtml = function(html) {
     s = s.replace(/\s+style="[^"]*mso-[^"]*"/gi, '');
     s = s.replace(/\u200B/g, '');
 
-    // 2. Convert <div> to <p>
-    // Browsers use <div> for new lines in contenteditable.
-    s = s.replace(/<div\b([^>]*)>/gi, '<p$1>');
-    s = s.replace(/<\/div>/gi, '</p>');
+    // Use a detached (never-attached-to-page) container so this never
+    // causes a visible flash or interferes with anything on screen.
+    const root = document.createElement('div');
+    root.innerHTML = s;
 
-    // 3. Remove empty/whitespace-only <p> blocks.
-    // contenteditable inserts <p><br></p> for blank lines between paragraphs.
-    // When combined with margin-bottom on the surrounding <p> tags these produce
-    // double spacing. Remove them — the margin-bottom on real <p> tags already
-    // provides the correct one-blank-line gap that matches the template view.
-    s = s.replace(/<p\b[^>]*>\s*(<br\s*\/?>\s*)*<\/p>/gi, '');
+    const BLOCK_TAGS = new Set(['DIV','P','UL','OL','LI','TABLE','TR','TD','TH','BLOCKQUOTE','H1','H2','H3','H4','H5','H6']);
+    const INLINE_SAFE = new Set(['SPAN','B','I','U','STRONG','EM','FONT','A','BR']);
 
-    // 4. Collapse runs of 2+ <br> tags to a single one.
-    // Templates with hand-typed line breaks sometimes produce <br><br> which
-    // renders as an extra blank line in Gmail.
+    // ---------------------------------------------------------------
+    // PASS 1: detect "blank-line" <br> pairs — a <br> whose next
+    // meaningful token (skipping whitespace-only text and inline tag
+    // open/close boundaries) is itself a <br>. Mark both as "remove".
+    // ---------------------------------------------------------------
+    function* forwardTokens(start) {
+        let node = start;
+        while (true) {
+            if (node.firstChild) {
+                node = node.firstChild;
+            } else {
+                while (node && !node.nextSibling) {
+                    node = node.parentNode;
+                    if (!node || node === root.parentNode) return;
+                    if (node === root) return;
+                    yield { type: 'close', node };
+                }
+                if (!node || node === root.parentNode || node === root) return;
+                node = node.nextSibling;
+            }
+            if (node === root) return;
+            if (node.nodeType === 1) yield { type: 'open', node };
+            else if (node.nodeType === 3) yield { type: 'text', node };
+        }
+    }
+
+    const brList = Array.from(root.querySelectorAll('br'));
+    const removeBr = new Set();
+    const consumed = new Set();
+
+    for (const br of brList) {
+        if (consumed.has(br)) continue;
+        let pairBr = null, stop = false;
+        for (const tok of forwardTokens(br)) {
+            if (tok.type === 'text') {
+                if (tok.node.nodeValue.trim() !== '') { stop = true; break; }
+                continue;
+            }
+            if (tok.type === 'open') {
+                if (tok.node.tagName === 'BR') { pairBr = tok.node; break; }
+                if (BLOCK_TAGS.has(tok.node.tagName)) { stop = true; break; }
+                continue; // inline open tag, keep scanning
+            }
+            if (tok.type === 'close') {
+                if (BLOCK_TAGS.has(tok.node.tagName)) { stop = true; break; }
+                continue; // inline close tag, keep scanning
+            }
+        }
+        if (pairBr) {
+            removeBr.add(br);
+            removeBr.add(pairBr);
+            consumed.add(pairBr);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // PASS 2: flatten the tree into an ordered list of paragraphs.
+    // We walk root's children recursively. Inline content accumulates
+    // into a "current paragraph buffer" (as cloned DOM nodes, so we
+    // never produce mismatched tags). A block element flushes the
+    // current buffer (if non-empty) as its own paragraph, then is
+    // itself recursed into (its children become subsequent paragraphs
+    // in the same flattened sequence) rather than kept as a nested
+    // wrapper — this is what correctly un-nests the AI-chat-tool
+    // div-soup while preserving inline formatting inside each line.
+    // A blank-line <br> pair (marked for removal) also flushes the
+    // current buffer as a paragraph and starts a new one.
+    // ---------------------------------------------------------------
+    const paragraphs = []; // array of arrays of cloned inline nodes
+    let buffer = [];
+
+    function nodeHasVisibleContent(n) {
+        if (n.nodeType === 3) return n.nodeValue.trim() !== '';
+        if (n.nodeType !== 1) return false;
+        if (n.tagName === 'BR') return false; // a lone br carries no text
+        if (n.tagName === 'IMG') return true; // images count as content
+        return Array.from(n.childNodes).some(nodeHasVisibleContent);
+    }
+
+    function flush() {
+        // Only flush if buffer has at least one node with real content
+        const hasContent = buffer.some(nodeHasVisibleContent);
+        if (hasContent) paragraphs.push(buffer);
+        buffer = [];
+    }
+
+    function walk(node) {
+        for (const child of Array.from(node.childNodes)) {
+            if (child.nodeType === 3) {
+                buffer.push(child.cloneNode(true));
+                continue;
+            }
+            if (child.nodeType !== 1) continue;
+
+            if (child.tagName === 'BR') {
+                if (removeBr.has(child)) {
+                    flush(); // blank line -> paragraph break
+                } else {
+                    buffer.push(child.cloneNode(true)); // ordinary line break, keep inline
+                }
+                continue;
+            }
+
+            if (BLOCK_TAGS.has(child.tagName)) {
+                flush(); // anything before this block is its own paragraph
+                if (child.tagName === 'UL' || child.tagName === 'OL') {
+                    // Keep lists intact as their own paragraph-equivalent block
+                    // (don't flatten li's individually into plain paragraphs).
+                    paragraphs.push([child.cloneNode(true)]);
+                } else {
+                    walk(child); // recurse: this block's children become more paragraphs
+                    flush();
+                }
+                continue;
+            }
+
+            // Inline element (span/b/i/a/etc): keep its wrapper, but we must
+            // still detect blank-line brs *inside* it and split around them.
+            // Simplest correct way: recurse into it the same way, but wrap
+            // each resulting inline run back in a clone of this element's
+            // tag so formatting (bold/italic/color) isn't lost across a
+            // paragraph split.
+            const subParagraphs = flattenInline(child, removeBr);
+            subParagraphs.forEach((run, i) => {
+                if (i > 0) flush();
+                const wrapper = child.cloneNode(false); // shallow clone (tag + attrs only)
+                run.forEach(n => wrapper.appendChild(n));
+                buffer.push(wrapper);
+            });
+        }
+    }
+
+    // Like walk(), but for inline elements: returns an array of "runs"
+    // (each run = array of nodes) split at blank-line br pairs found at
+    // any depth inside this inline element. Does not handle block tags
+    // (none should appear inside inline elements in practice, but if they
+    // do, we just treat them as ordinary content rather than crashing).
+    function flattenInline(el) {
+        const runs = [[]];
+        function inner(node) {
+            for (const child of Array.from(node.childNodes)) {
+                if (child.nodeType === 3) {
+                    runs[runs.length - 1].push(child.cloneNode(true));
+                    continue;
+                }
+                if (child.nodeType !== 1) continue;
+                if (child.tagName === 'BR') {
+                    if (removeBr.has(child)) {
+                        runs.push([]); // start a new run = new paragraph later
+                    } else {
+                        runs[runs.length - 1].push(child.cloneNode(true));
+                    }
+                    continue;
+                }
+                if (BLOCK_TAGS.has(child.tagName)) {
+                    // Unexpected, but handle gracefully: treat its flattened
+                    // content as part of the current run via recursion.
+                    inner(child);
+                    continue;
+                }
+                // Nested inline element: recurse and re-wrap each sub-run.
+                const subRuns = flattenInline(child);
+                subRuns.forEach((run, i) => {
+                    if (i > 0) runs.push([]);
+                    const wrapper = child.cloneNode(false);
+                    run.forEach(n => wrapper.appendChild(n));
+                    runs[runs.length - 1].push(wrapper);
+                });
+            }
+        }
+        inner(el);
+        return runs;
+    }
+
+    walk(root);
+    flush();
+
+    // ---------------------------------------------------------------
+    // PASS 3: serialize paragraphs to clean HTML.
+    // ---------------------------------------------------------------
+    // Recursively prune nodes/subtrees that carry no visible content,
+    // and drop leading/trailing standalone <br> *anywhere* a paragraph
+    // starts or ends (including inside a wrapper like <b><br></b> sitting
+    // at the very start of a paragraph) so no empty inline shells leak
+    // into the output.
+    function pruneEmpty(node) {
+        // Returns true if `node` should be removed entirely.
+        if (node.nodeType === 3) return node.nodeValue.trim() === '';
+        if (node.nodeType !== 1) return false;
+        if (node.tagName === 'BR' || node.tagName === 'IMG') return false; // never auto-prune these
+        Array.from(node.childNodes).forEach(child => {
+            if (pruneEmpty(child)) child.remove();
+        });
+        return node.childNodes.length === 0;
+    }
+
+    function stripEdgeBrs(container) {
+        // Remove a single leading <br> (descending into the first child
+        // chain) and a single trailing <br> (descending into the last
+        // child chain), repeatedly, since these are stray artifacts left
+        // at paragraph edges rather than intentional line breaks.
+        function leadingBr() {
+            let node = container;
+            while (node) {
+                if (node.tagName === 'BR') return node;
+                if (!node.firstChild) return null;
+                node = node.firstChild;
+            }
+            return null;
+        }
+        function trailingBr() {
+            let node = container;
+            while (node) {
+                if (node.tagName === 'BR') return node;
+                if (!node.lastChild) return null;
+                node = node.lastChild;
+            }
+            return null;
+        }
+        let guard = 0;
+        while (guard++ < 50) {
+            const lb = leadingBr();
+            if (!lb) break;
+            lb.remove();
+        }
+        guard = 0;
+        while (guard++ < 50) {
+            const tb = trailingBr();
+            if (!tb) break;
+            tb.remove();
+        }
+    }
+
+    function serializeNodes(nodes) {
+        const tmp = document.createElement('div');
+        nodes.forEach(n => tmp.appendChild(n));
+        stripEdgeBrs(tmp);
+        // Prune any now-empty wrapper elements left behind (e.g. <b></b>
+        // after its only content, a <br>, was stripped above).
+        Array.from(tmp.childNodes).forEach(child => {
+            if (pruneEmpty(child)) child.remove();
+        });
+        return tmp.innerHTML;
+    }
+
+    let out = '';
+    for (const p of paragraphs) {
+        // If this "paragraph" is actually a single UL/OL block, don't wrap
+        // it in <p> — keep it as the list itself.
+        if (p.length === 1 && p[0].nodeType === 1 && (p[0].tagName === 'UL' || p[0].tagName === 'OL')) {
+            out += p[0].outerHTML;
+            continue;
+        }
+        const inner = serializeNodes(p).trim();
+        if (inner === '') continue;
+        out += `<p>${inner}</p>`;
+    }
+    s = out;
+
+    // Collapse any remaining runs of 2+ <br> inside a paragraph (e.g. odd
+    // leftover cases) down to one.
     s = s.replace(/(<br\s*\/?>\s*){2,}/gi, '<br>');
 
-    // 5. Strip any trailing <br> tags to prevent a blank bottom gap.
-    s = s.replace(/(<br\s*\/?>\s*)+$/gi, '');
-
-    // 6. Inject inline spacing styles — use margin-bottom:1em to reproduce the
-    //    single blank line between paragraphs exactly as shown in the template.
+    // Inject inline spacing styles — margin-bottom:1em reproduces the
+    // single blank line between paragraphs, matching the editor view.
     const ensureStyle = (tag, extra) => {
         const withStyle = new RegExp(`<${tag}\\b([^>]*?)\\sstyle="([^"]*)"([^>]*)>`, 'gi');
         s = s.replace(withStyle, (m, before, existing, after) => {
@@ -652,7 +902,6 @@ window._normalizeEmailHtml = function(html) {
         s = s.replace(noStyle, `<${tag}$1 style="${extra}">`);
     };
 
-    // margin-bottom:1em = one blank line gap between paragraphs (matches template)
     ensureStyle('p',  'margin:0 0 1em 0; line-height:1.5;');
     ensureStyle('ul', 'margin:0 0 1em 24px; padding:0; line-height:1.5;');
     ensureStyle('ol', 'margin:0 0 1em 24px; padding:0; line-height:1.5;');
@@ -660,6 +909,7 @@ window._normalizeEmailHtml = function(html) {
 
     return s.trim();
 };
+
 
 console.log('✅ Enhanced Email System Loaded');
 console.log('   - Modal opening: Fixed');
