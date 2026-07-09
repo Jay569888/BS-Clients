@@ -33,7 +33,7 @@ window._buildReplacer = function(lead) {
     }
     const gdriveLink = lead.gdrive || '';
     const gdriveHtml = gdriveLink
-        ? `<a href="${gdriveLink}" style="color:#1e3a5f;font-weight:bold;text-decoration:underline;">UPLOAD YOUR EVIDENCE</a>`
+        ? `<a href="${gdriveLink}" style="color:#1e3a5f;font-weight:bold;text-decoration:underline;">CLICK HERE TO UPLOAD EVIDENCE</a>`
         : '<span style="color:#999;font-style:italic;">[No Drive Link Provided]</span>';
         
     return str => (str || '')
